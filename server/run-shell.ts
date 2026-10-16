@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { basename } from "node:path";
+import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { ShellRun } from "../shared/shell-run";
 import { createOutputBuffer } from "./output-buffer";
@@ -17,6 +19,8 @@ export interface ShellRunOptions {
   // Writes the row to the agent timeline. Called with the same run id for every update.
   append(row: ShellRun): Promise<unknown>;
   onError?(error: unknown): void;
+  // Environment for the shell, and the source of $SHELL. Defaults to the daemon's.
+  env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
   killGraceMs?: number;
   throttleMs?: number;
@@ -38,14 +42,45 @@ function describeSpawnError(error: Error, cwd: string): string {
   return error.message;
 }
 
-function spawnShell(command: string, cwd: string) {
-  return spawn(process.env.SHELL || "/bin/sh", ["-c", command], {
+const NO_PROMPTS = { GIT_EDITOR: "true", GIT_TERMINAL_PROMPT: "0" };
+
+// zsh and bash run as login, interactive shells so the user's rc files apply. With no terminal
+// they print job-control and rc noise on stderr. The command's own output is moved to fds 3 and 4
+// after the rc files have loaded, so only the command's output is read. The rc files may also
+// set their own GIT_EDITOR, so the prompt guards are exported after they load.
+const RC_PREAMBLE = "exec 1>&3 2>&4 3>&- 4>&-\nexport GIT_EDITOR=true GIT_TERMINAL_PROMPT=0\n";
+// A login bash prints "logout" to stderr on exit.
+const BASH_PREAMBLE = `${RC_PREAMBLE}exit() { builtin exit "$@" 2>/dev/null; }\n`;
+const RC_PREAMBLES: Partial<Record<string, string>> = {
+  zsh: RC_PREAMBLE,
+  bash: BASH_PREAMBLE,
+};
+
+function spawnShell(command: string, cwd: string, env: NodeJS.ProcessEnv) {
+  const shell = env.SHELL || "/bin/sh";
+  const preamble = RC_PREAMBLES[basename(shell)];
+  const options = {
     cwd,
     detached: true,
-    stdio: ["ignore", "pipe", "pipe"],
     // No terminal is attached, so git must fail fast instead of waiting on an editor or a prompt.
-    env: { ...process.env, GIT_EDITOR: "true", GIT_TERMINAL_PROMPT: "0" },
+    env: { ...env, ...NO_PROMPTS },
+  } as const;
+  if (preamble === undefined) {
+    const child = spawn(shell, ["-c", command], {
+      ...options,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { child, outputs: [child.stdout, child.stderr] };
+  }
+  const child = spawn(shell, ["-lic", preamble + command], {
+    ...options,
+    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
   });
+  // Both descriptors were opened as pipes just above.
+  return {
+    child,
+    outputs: [child.stdio[3] as Readable, child.stdio[4] as Readable],
+  };
 }
 
 export function startShellRun(options: ShellRunOptions): ShellRunHandle {
@@ -84,13 +119,15 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
   const started = publisher.now(runningRow());
   started.catch(() => undefined);
 
-  let child: ReturnType<typeof spawnShell>;
+  let shell: ReturnType<typeof spawnShell>;
   try {
-    child = spawnShell(command, cwd);
+    shell = spawnShell(command, cwd, options.env ?? process.env);
   } catch (error) {
     finish({ state: "failed", message: error instanceof Error ? error.message : String(error) });
     return { runId, started, done, cancel: () => undefined };
   }
+
+  const { child, outputs } = shell;
 
   // The shell leads its own process group, so one signal reaches everything it started.
   function signalGroup(signal: NodeJS.Signals): void {
@@ -109,7 +146,7 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
     killTimer = setTimeout(() => signalGroup("SIGKILL"), killGraceMs);
   }
 
-  for (const stream of [child.stdout, child.stderr]) {
+  for (const stream of outputs) {
     const decoder = new StringDecoder("utf8");
     stream.on("data", (chunk: Buffer) => {
       output.append(decoder.write(chunk));

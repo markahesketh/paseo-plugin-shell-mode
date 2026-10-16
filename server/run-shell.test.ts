@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -6,10 +6,21 @@ import type { ShellRun } from "../shared/shell-run";
 import { startShellRun } from "./run-shell";
 
 let cwd: string;
+let home: string;
+let env: NodeJS.ProcessEnv;
 beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "shell-mode-"));
+  home = mkdtempSync(join(tmpdir(), "shell-mode-home-"));
 });
-afterEach(() => rmSync(cwd, { recursive: true, force: true }));
+afterEach(() => {
+  rmSync(cwd, { recursive: true, force: true });
+  rmSync(home, { recursive: true, force: true });
+});
+
+// Points the shell's rc lookup at the temp home, so the tester's own rc files never load.
+function isolatedEnv(shell: string): NodeJS.ProcessEnv {
+  return { ...process.env, SHELL: shell, HOME: home, ZDOTDIR: home };
+}
 
 // Appends take a random moment, as a real round trip to the daemon would.
 function collect() {
@@ -23,13 +34,32 @@ function collect() {
 
 async function run(command: string, options: Partial<Parameters<typeof startShellRun>[0]> = {}) {
   const { rows, append } = collect();
-  const handle = startShellRun({ runId: "run-1", command, cwd, append, ...options });
+  const handle = startShellRun({ runId: "run-1", command, cwd, append, env, ...options });
   await handle.started;
   await handle.done;
   return { rows, last: rows[rows.length - 1]!, handle };
 }
 
-describe("startShellRun", () => {
+// macOS ships bash 3.2, which closes the extra descriptors when started with both -l and -i.
+const BASH = (
+  process.platform === "darwin"
+    ? ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
+    : ["/bin/bash", "/usr/bin/bash"]
+).find((path) => existsSync(path));
+
+const SHELLS = [
+  { name: "sh (-c)", shell: "/bin/sh" },
+  { name: "zsh (login, interactive)", shell: "/bin/zsh" },
+  { name: "bash (login, interactive)", shell: BASH },
+].filter((entry): entry is { name: string; shell: string } =>
+  Boolean(entry.shell && existsSync(entry.shell)),
+);
+
+describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
+  beforeEach(() => {
+    env = isolatedEnv(shell);
+  });
+
   it("runs a command, interleaves stdout and stderr, and ends with the exit code", async () => {
     const { rows, last } = await run("printf a; sleep 0.1; printf b >&2; exit 3");
     expect(rows[0]).toMatchObject({ state: "running", runId: "run-1", output: "" });
@@ -60,7 +90,7 @@ describe("startShellRun", () => {
 
   it("cancels the whole process group", async () => {
     const { rows, append } = collect();
-    const handle = startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, append });
+    const handle = startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, append, env });
     await handle.started;
     await waitFor(() => rows.some((row) => /\d+/.test(row.output)));
     const pid = Number(rows.find((row) => /\d+/.test(row.output))!.output.trim());
@@ -81,9 +111,41 @@ describe("startShellRun", () => {
   });
 });
 
+const RC_SHELLS = [
+  { name: "zsh", shell: "/bin/zsh", rcFile: ".zshrc" },
+  { name: "bash", shell: BASH, rcFile: ".bash_profile" },
+].filter((entry): entry is { name: string; shell: string; rcFile: string } =>
+  Boolean(entry.shell && existsSync(entry.shell)),
+);
+
+describe.each(RC_SHELLS)("$name rc files", ({ shell, rcFile }) => {
+  it("applies the rc file, hides its startup output, and keeps the git prompt guards", async () => {
+    const rc = [
+      "alias hi='echo aliased'",
+      "echo rc-stdout-noise",
+      "echo rc-stderr-noise >&2",
+      "export GIT_EDITOR=vim",
+    ];
+    writeFileSync(join(home, rcFile), rc.join("\n"));
+    env = isolatedEnv(shell);
+    const { last } = await run('hi; echo "editor=$GIT_EDITOR"');
+    expect(last).toMatchObject({ state: "exited", exitCode: 0 });
+    expect(last.output).toBe("aliased\neditor=true\n");
+  });
+});
+
+describe("shells without rc support", () => {
+  it("runs with -c and does not read rc files", async () => {
+    writeFileSync(join(home, ".profile"), "echo profile-noise\n");
+    env = isolatedEnv("/bin/sh");
+    const { last } = await run("echo ok");
+    expect(last.output).toBe("ok\n");
+  });
+});
+
 async function runAndCancel(command: string) {
   const { rows, append } = collect();
-  const handle = startShellRun({ runId: "r", command, cwd, append, killGraceMs: 100 });
+  const handle = startShellRun({ runId: "r", command, cwd, append, env, killGraceMs: 100 });
   await handle.started;
   await new Promise((resolve) => setTimeout(resolve, 100));
   handle.cancel();
