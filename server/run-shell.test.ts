@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -40,20 +40,21 @@ async function run(command: string, options: Partial<Parameters<typeof startShel
   return { rows, last: rows[rows.length - 1]!, handle };
 }
 
-// macOS ships bash 3.2, which closes the extra descriptors when started with both -l and -i.
-const BASH = (
+// macOS ships bash 3.2 as /bin/bash, and users often add a newer one with Homebrew. Both must work.
+const BASHES = (
   process.platform === "darwin"
-    ? ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
+    ? ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
     : ["/bin/bash", "/usr/bin/bash"]
-).find((path) => existsSync(path));
+).filter(
+  (path, index, all) =>
+    existsSync(path) && all.findIndex((p) => existsSync(p) && realpathSync(p) === realpathSync(path)) === index,
+);
 
 const SHELLS = [
   { name: "sh (-c)", shell: "/bin/sh" },
   { name: "zsh (login, interactive)", shell: "/bin/zsh" },
-  { name: "bash (login, interactive)", shell: BASH },
-].filter((entry): entry is { name: string; shell: string } =>
-  Boolean(entry.shell && existsSync(entry.shell)),
-);
+  ...BASHES.map((shell) => ({ name: `bash (login, interactive) ${shell}`, shell })),
+].filter((entry) => existsSync(entry.shell));
 
 describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
   beforeEach(() => {
@@ -92,8 +93,10 @@ describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
     const { rows, append } = collect();
     const handle = startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, append, env });
     await handle.started;
-    await waitFor(() => rows.some((row) => /\d+/.test(row.output)));
-    const pid = Number(rows.find((row) => /\d+/.test(row.output))!.output.trim());
+    const pidLine = /^\d+$/m;
+    await waitFor(() => rows.some((row) => pidLine.test(row.output)));
+    const pid = Number(pidLine.exec(rows.find((row) => pidLine.test(row.output))!.output)![0]);
+    expect(alive(pid)).toBe(true);
     handle.cancel();
     await handle.done;
     expect(rows[rows.length - 1]).toMatchObject({ state: "killed", reason: "canceled" });
@@ -113,12 +116,14 @@ describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
 
 const RC_SHELLS = [
   { name: "zsh", shell: "/bin/zsh", rcFile: ".zshrc" },
-  { name: "bash", shell: BASH, rcFile: ".bash_profile" },
-].filter((entry): entry is { name: string; shell: string; rcFile: string } =>
-  Boolean(entry.shell && existsSync(entry.shell)),
-);
+  ...BASHES.map((shell) => ({ name: `bash ${shell}`, shell, rcFile: ".bash_profile" })),
+].filter((entry) => existsSync(entry.shell));
 
 describe.each(RC_SHELLS)("$name rc files", ({ shell, rcFile }) => {
+  beforeEach(() => {
+    env = isolatedEnv(shell);
+  });
+
   it("applies the rc file, hides its startup output, and keeps the git prompt guards", async () => {
     const rc = [
       "alias hi='echo aliased'",
@@ -127,10 +132,34 @@ describe.each(RC_SHELLS)("$name rc files", ({ shell, rcFile }) => {
       "export GIT_EDITOR=vim",
     ];
     writeFileSync(join(home, rcFile), rc.join("\n"));
-    env = isolatedEnv(shell);
     const { last } = await run('hi; echo "editor=$GIT_EDITOR"');
     expect(last).toMatchObject({ state: "exited", exitCode: 0 });
     expect(last.output).toBe("aliased\neditor=true\n");
+  });
+
+  it("hides rc output that has no trailing newline", async () => {
+    writeFileSync(join(home, rcFile), "printf rc-stdout; printf rc-stderr >&2");
+    const { last } = await run("printf out");
+    expect(last).toMatchObject({ state: "exited", exitCode: 0, output: "out" });
+  });
+
+  it("shows the rc file's output when it exits before the command runs", async () => {
+    writeFileSync(join(home, rcFile), "echo rc-stdout\necho rc-stderr >&2\nexit 3");
+    const { last } = await run("echo never");
+    expect(last).toMatchObject({ state: "exited", exitCode: 3 });
+    expect(last.output).toContain("rc-stdout");
+    expect(last.output).toContain("rc-stderr");
+    expect(last.output).not.toContain("never");
+  });
+});
+
+describe.each(BASHES)("bash %s profile", (shell) => {
+  it("loads .bashrc when .bash_profile sources it", async () => {
+    writeFileSync(join(home, ".bash_profile"), '[ -f ~/.bashrc ] && . ~/.bashrc\n');
+    writeFileSync(join(home, ".bashrc"), "alias hi='echo from-bashrc'\necho bashrc-noise\n");
+    env = isolatedEnv(shell);
+    const { last } = await run("hi");
+    expect(last).toMatchObject({ state: "exited", exitCode: 0, output: "from-bashrc\n" });
   });
 });
 

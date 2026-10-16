@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
-import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { ShellRun } from "../shared/shell-run";
 import { createOutputBuffer } from "./output-buffer";
+import { createStartGate } from "./start-gate";
 import { buildRow, statusAfterExit, type RunStatus, type StopReason } from "./row";
 import { createThrottledPublisher } from "./throttled-publisher";
 
@@ -45,42 +45,46 @@ function describeSpawnError(error: Error, cwd: string): string {
 const NO_PROMPTS = { GIT_EDITOR: "true", GIT_TERMINAL_PROMPT: "0" };
 
 // zsh and bash run as login, interactive shells so the user's rc files apply. With no terminal
-// they print job-control and rc noise on stderr. The command's own output is moved to fds 3 and 4
-// after the rc files have loaded, so only the command's output is read. The rc files may also
-// set their own GIT_EDITOR, so the prompt guards are exported after they load.
-const RC_PREAMBLE = "exec 1>&3 2>&4 3>&- 4>&-\nexport GIT_EDITOR=true GIT_TERMINAL_PROMPT=0\n";
-// A login bash prints "logout" to stderr on exit.
-const BASH_PREAMBLE = `${RC_PREAMBLE}exit() { builtin exit "$@" 2>/dev/null; }\n`;
-const RC_PREAMBLES: Partial<Record<string, string>> = {
-  zsh: RC_PREAMBLE,
-  bash: BASH_PREAMBLE,
+// they print job-control and rc noise. Once the rc files have loaded, the preamble prints a
+// marker line on both streams and the output before it is dropped. The rc files may set their
+// own GIT_EDITOR, so the prompt guards are exported after they load.
+// Extra lines per shell. A login bash prints "logout" to stderr on exit. Bash 3.2 gives each
+// background job its own process group unless job control is off, which would escape cancel.
+const RC_SHELL_EXTRAS: Partial<Record<string, string>> = {
+  zsh: "",
+  bash: 'set +m\nexit() { builtin exit "$@" 2>/dev/null; }\n',
 };
 
-function spawnShell(command: string, cwd: string, env: NodeJS.ProcessEnv) {
+function rcPreamble(shell: string, marker: string): string | undefined {
+  const extra = RC_SHELL_EXTRAS[basename(shell)];
+  if (extra === undefined) return undefined;
+  return [
+    "export GIT_EDITOR=true GIT_TERMINAL_PROMPT=0\n",
+    `builtin printf '\\n%s\\n' ${marker}; builtin printf '\\n%s\\n' ${marker} >&2\n`,
+    extra,
+  ].join("");
+}
+
+// The runId may hold anything, and the marker is spliced into shell text.
+function startMarker(runId: string): string {
+  return `shell-mode-start-${runId.replace(/[^A-Za-z0-9]/g, "")}`;
+}
+
+function spawnShell(runId: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
   const shell = env.SHELL || "/bin/sh";
-  const preamble = RC_PREAMBLES[basename(shell)];
+  const marker = startMarker(runId);
+  const preamble = rcPreamble(shell, marker);
   const options = {
     cwd,
     detached: true,
     // No terminal is attached, so git must fail fast instead of waiting on an editor or a prompt.
     env: { ...env, ...NO_PROMPTS },
   } as const;
+  const stdio = ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"];
   if (preamble === undefined) {
-    const child = spawn(shell, ["-c", command], {
-      ...options,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    return { child, outputs: [child.stdout, child.stderr] };
+    return { child: spawn(shell, ["-c", command], { ...options, stdio }), marker: undefined };
   }
-  const child = spawn(shell, ["-lic", preamble + command], {
-    ...options,
-    stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
-  });
-  // Both descriptors were opened as pipes just above.
-  return {
-    child,
-    outputs: [child.stdio[3] as Readable, child.stdio[4] as Readable],
-  };
+  return { child: spawn(shell, ["-lic", preamble + command], { ...options, stdio }), marker };
 }
 
 export function startShellRun(options: ShellRunOptions): ShellRunHandle {
@@ -121,13 +125,13 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
 
   let shell: ReturnType<typeof spawnShell>;
   try {
-    shell = spawnShell(command, cwd, options.env ?? process.env);
+    shell = spawnShell(runId, command, cwd, options.env ?? process.env);
   } catch (error) {
     finish({ state: "failed", message: error instanceof Error ? error.message : String(error) });
     return { runId, started, done, cancel: () => undefined };
   }
 
-  const { child, outputs } = shell;
+  const { child, marker } = shell;
 
   // The shell leads its own process group, so one signal reaches everything it started.
   function signalGroup(signal: NodeJS.Signals): void {
@@ -146,13 +150,21 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
     killTimer = setTimeout(() => signalGroup("SIGKILL"), killGraceMs);
   }
 
-  for (const stream of outputs) {
+  for (const stream of [child.stdout, child.stderr]) {
     const decoder = new StringDecoder("utf8");
+    const gate = marker === undefined ? undefined : createStartGate(marker);
+    const append = (text: string) => {
+      if (text) output.append(text);
+    };
     stream.on("data", (chunk: Buffer) => {
-      output.append(decoder.write(chunk));
+      const text = decoder.write(chunk);
+      append(gate ? gate.push(text) : text);
       publisher.schedule(runningRow);
     });
-    stream.on("end", () => output.append(decoder.end()));
+    stream.on("end", () => {
+      const text = decoder.end();
+      append(gate ? gate.push(text) + gate.end() : text);
+    });
   }
 
   child.on("error", (error) => {
