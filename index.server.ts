@@ -20,7 +20,7 @@ export default function contribute(server: PluginServerContext) {
       runId,
       command,
       cwd,
-      append: (data) =>
+      publish: (data) =>
         timeline.append({
           type: "plugin",
           id: runId,
@@ -32,7 +32,6 @@ export default function contribute(server: PluginServerContext) {
     try {
       await run.started;
     } catch (error) {
-      // Without the first row the user would see nothing, so surface the failure instead.
       run.cancel();
       throw error;
     }

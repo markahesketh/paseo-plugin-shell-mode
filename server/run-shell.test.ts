@@ -17,30 +17,27 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-// Points the shell's rc lookup at the temp home, so the tester's own rc files never load.
 function isolatedEnv(shell: string): NodeJS.ProcessEnv {
   return { ...process.env, SHELL: shell, HOME: home, ZDOTDIR: home };
 }
 
-// Appends take a random moment, as a real round trip to the daemon would.
 function collect() {
   const rows: ShellRun[] = [];
-  const append = async (row: ShellRun) => {
+  const publish = async (row: ShellRun) => {
     await new Promise((resolve) => setTimeout(resolve, Math.random() * 20));
     rows.push(row);
   };
-  return { rows, append };
+  return { rows, publish };
 }
 
 async function run(command: string, options: Partial<Parameters<typeof startShellRun>[0]> = {}) {
-  const { rows, append } = collect();
-  const handle = startShellRun({ runId: "run-1", command, cwd, append, env, ...options });
+  const { rows, publish } = collect();
+  const handle = startShellRun({ runId: "run-1", command, cwd, publish, env, ...options });
   await handle.started;
   await handle.done;
   return { rows, last: rows[rows.length - 1]!, handle };
 }
 
-// macOS ships bash 3.2 as /bin/bash, and users often add a newer one with Homebrew. Both must work.
 const BASHES = (
   process.platform === "darwin"
     ? ["/bin/bash", "/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
@@ -90,8 +87,8 @@ describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
   });
 
   it("cancels the whole process group", async () => {
-    const { rows, append } = collect();
-    const handle = startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, append, env });
+    const { rows, publish } = collect();
+    const handle = startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, publish, env });
     await handle.started;
     const pidLine = /^\d+$/m;
     await waitFor(() => rows.some((row) => pidLine.test(row.output)));
@@ -173,8 +170,8 @@ describe("shells without rc support", () => {
 });
 
 async function runAndCancel(command: string) {
-  const { rows, append } = collect();
-  const handle = startShellRun({ runId: "r", command, cwd, append, env, killGraceMs: 100 });
+  const { rows, publish } = collect();
+  const handle = startShellRun({ runId: "r", command, cwd, publish, env, killGraceMs: 100 });
   await handle.started;
   await new Promise((resolve) => setTimeout(resolve, 100));
   handle.cancel();

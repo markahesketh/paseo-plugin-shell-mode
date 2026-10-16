@@ -20,7 +20,6 @@ export function describeStatus(run: ShellRun): StatusLabel {
   }
 }
 
-// Only a finished run has a duration. A running one would need the daemon's clock.
 export function durationOf(run: ShellRun): number | null {
   return run.state === "exited" || run.state === "killed" ? run.durationMs : null;
 }

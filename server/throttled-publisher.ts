@@ -1,9 +1,6 @@
 export interface ThrottledPublisher<Value> {
-  // Sends after any send already in flight. Rejects if this send fails.
   now(value: Value): Promise<void>;
-  // Sends the latest requested value at most once per interval. `build` runs only when it sends.
   schedule(build: () => Value): void;
-  // Drops any pending scheduled send, then sends the value after everything already in flight.
   finish(value: Value): Promise<void>;
 }
 
@@ -14,7 +11,6 @@ export function createThrottledPublisher<Value>(
   intervalMs: number,
   onError: (error: unknown) => void,
 ): ThrottledPublisher<Value> {
-  // Sends run one at a time in order, so a late throttled value can never land after the final one.
   let tail: Promise<void> = Promise.resolve();
   let pending: (() => Value) | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;

@@ -4,7 +4,7 @@ import { basename } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { ShellRun } from "../shared/shell-run";
 import { createOutputBuffer } from "./output-buffer";
-import { createStartGate } from "./start-gate";
+import { createStartGate, markerLine } from "./start-gate";
 import { buildRow, statusAfterExit, type RunStatus, type StopReason } from "./row";
 import { createThrottledPublisher } from "./throttled-publisher";
 
@@ -16,10 +16,8 @@ export interface ShellRunOptions {
   runId: string;
   command: string;
   cwd: string;
-  // Writes the row to the agent timeline. Called with the same run id for every update.
-  append(row: ShellRun): Promise<unknown>;
+  publish(row: ShellRun): Promise<unknown>;
   onError?(error: unknown): void;
-  // Environment for the shell, and the source of $SHELL. Defaults to the daemon's.
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
   killGraceMs?: number;
@@ -28,9 +26,7 @@ export interface ShellRunOptions {
 
 export interface ShellRunHandle {
   runId: string;
-  // Resolves once the first row is appended. Rejects if it could not be.
   started: Promise<void>;
-  // Resolves once the final row is appended. Never rejects.
   done: Promise<void>;
   cancel(): void;
 }
@@ -44,11 +40,7 @@ function describeSpawnError(error: Error, cwd: string): string {
 
 const NO_PROMPTS = { GIT_EDITOR: "true", GIT_TERMINAL_PROMPT: "0" };
 
-// zsh and bash run as login, interactive shells so the user's rc files apply. With no terminal
-// they print job-control and rc noise. Once the rc files have loaded, the preamble prints a
-// marker line on both streams and the output before it is dropped. The rc files may set their
-// own GIT_EDITOR, so the prompt guards are exported after they load.
-// Extra lines per shell. A login bash prints "logout" to stderr on exit. Bash 3.2 gives each
+// A login bash prints "logout" to stderr on exit. Bash 3.2 gives each
 // background job its own process group unless job control is off, which would escape cancel.
 const RC_SHELL_EXTRAS: Partial<Record<string, string>> = {
   zsh: "",
@@ -59,13 +51,12 @@ function rcPreamble(shell: string, marker: string): string | undefined {
   const extra = RC_SHELL_EXTRAS[basename(shell)];
   if (extra === undefined) return undefined;
   return [
-    "export GIT_EDITOR=true GIT_TERMINAL_PROMPT=0\n",
-    `builtin printf '\\n%s\\n' ${marker}; builtin printf '\\n%s\\n' ${marker} >&2\n`,
+    `export ${Object.entries(NO_PROMPTS).map(([name, value]) => `${name}=${value}`).join(" ")}\n`,
+    `builtin printf %s '${markerLine(marker)}'; builtin printf %s '${markerLine(marker)}' >&2\n`,
     extra,
   ].join("");
 }
 
-// The runId may hold anything, and the marker is spliced into shell text.
 function startMarker(runId: string): string {
   return `shell-mode-start-${runId.replace(/[^A-Za-z0-9]/g, "")}`;
 }
@@ -77,7 +68,6 @@ function spawnShell(runId: string, command: string, cwd: string, env: NodeJS.Pro
   const options = {
     cwd,
     detached: true,
-    // No terminal is attached, so git must fail fast instead of waiting on an editor or a prompt.
     env: { ...env, ...NO_PROMPTS },
   } as const;
   const stdio = ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"];
@@ -96,7 +86,7 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
   const meta = { command, cwd, startedAt: Date.now() };
   const output = createOutputBuffer();
   const publisher = createThrottledPublisher(
-    options.append,
+    options.publish,
     options.throttleMs ?? DEFAULT_THROTTLE_MS,
     onError,
   );
@@ -133,13 +123,12 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
 
   const { child, marker } = shell;
 
-  // The shell leads its own process group, so one signal reaches everything it started.
   function signalGroup(signal: NodeJS.Signals): void {
     if (child.pid === undefined) return;
     try {
       process.kill(-child.pid, signal);
-    } catch {
-      // The group is already gone.
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") onError(error);
     }
   }
 

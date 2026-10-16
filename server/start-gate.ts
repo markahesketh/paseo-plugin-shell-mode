@@ -1,14 +1,12 @@
 export interface StartGate {
-  // Returns the text to pass on: nothing until the marker line has been seen, then everything.
   push(text: string): string;
-  // Called when the stream closes. If the marker never arrived, the held text is released.
   end(): string;
 }
 
-// Drops everything a shell prints before its start marker line, including the newline printed
-// ahead of the marker so output without a trailing newline goes with it.
+export const markerLine = (marker: string) => `\n${marker}\n`;
+
 export function createStartGate(marker: string): StartGate {
-  const needle = `\n${marker}\n`;
+  const needle = markerLine(marker);
   let held: string | null = "";
 
   return {

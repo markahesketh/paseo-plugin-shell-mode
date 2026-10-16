@@ -1,16 +1,11 @@
 import { OUTPUT_TAIL_BYTES } from "../shared/shell-run";
 
 const ESC = "\x1b";
-const ANSI_SEQUENCE = new RegExp(
-  [
-    `${ESC}\\[[0-?]*[ -/]*[@-~]`, // CSI: colors, cursor movement
-    `${ESC}\\][^\\x07${ESC}]*(?:\\x07|${ESC}\\\\)`, // OSC: titles, hyperlinks
-    `${ESC}[()][ -~]`, // charset selection
-    `${ESC}[@-Z\\\\-_]`, // two-character escapes
-  ].join("|"),
-  "g",
-);
-// An escape sequence cut off by the end of a chunk, held back until the next chunk completes it.
+const CSI = `${ESC}\\[[0-?]*[ -/]*[@-~]`;
+const OSC = `${ESC}\\][^\\x07${ESC}]*(?:\\x07|${ESC}\\\\)`;
+const CHARSET_SELECTION = `${ESC}[()][ -~]`;
+const TWO_CHAR_ESCAPE = `${ESC}[@-Z\\\\-_]`;
+const ANSI_SEQUENCE = new RegExp([CSI, OSC, CHARSET_SELECTION, TWO_CHAR_ESCAPE].join("|"), "g");
 const INCOMPLETE_SEQUENCE = new RegExp(
   `${ESC}(?:\\[[0-?]*[ -/]*|\\][^\\x07${ESC}]*${ESC}?|[()])?$`,
 );
@@ -30,11 +25,12 @@ export function stripAnsi(text: string): string {
   return text.replace(ANSI_SEQUENCE, "");
 }
 
-// Keeps the last maxBytes of UTF-8 without splitting a character.
+const isUtf8ContinuationByte = (byte: number) => (byte & 0xc0) === 0x80;
+
 function lastBytes(text: string, maxBytes: number): string {
   const bytes = Buffer.from(text, "utf8");
   let start = bytes.length - maxBytes;
-  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start++;
+  while (start < bytes.length && isUtf8ContinuationByte(bytes[start]!)) start++;
   return bytes.subarray(start).toString("utf8");
 }
 

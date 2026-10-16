@@ -2,9 +2,7 @@ import { startShellRun, type ShellRunHandle, type ShellRunOptions } from "./run-
 
 export interface ShellRuns {
   start(options: ShellRunOptions): ShellRunHandle;
-  // A run that already finished is not an error: the user may press Stop as it ends.
   cancel(runId: string): void;
-  // Stops every live run and waits for each to write its final row.
   stopAll(): Promise<void>;
 }
 

@@ -32,7 +32,6 @@ describe("buildRow", () => {
   });
 
   it("drops more of the head when serialized output is larger than its text", () => {
-    // Each control byte serializes as a 6 byte \u escape, so 48 KiB of them is far over 64 KiB.
     const output = "\x07".repeat(48 * 1024) + "tail";
     const row = buildRow(meta, { output, truncated: false }, { state: "failed", message: "m" });
     expect(Buffer.byteLength(JSON.stringify(row))).toBeLessThan(64 * 1024);
