@@ -1,10 +1,10 @@
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ShellRun } from "../shared/shell-run";
 import { startShellRun } from "./run-shell";
-import { alive, expectDies, printedPid } from "./test-processes";
+import { alive, expectDies, printedPid, waitFor } from "./test-processes";
 
 let cwd: string;
 let home: string;
@@ -192,14 +192,14 @@ describe.each(BASHES)("bash %s profile", (shell) => {
 describe("a run whose first row cannot be published", () => {
   it("kills the command", async () => {
     env = isolatedEnv("/bin/sh");
-    const rows: ShellRun[] = [];
-    const publish = async (row: ShellRun) => {
-      rows.push(row);
+    const pidFile = join(cwd, "pid");
+    const publish = async () => {
+      await waitFor(() => existsSync(pidFile));
       throw new Error("timeline unavailable");
     };
     const handle = startShellRun({
       runId: "r",
-      command: "trap '' TERM; echo $$; while :; do :; done",
+      command: "trap '' TERM; echo $$ > pid.tmp; mv pid.tmp pid; while :; do :; done",
       cwd,
       publish,
       env,
@@ -207,8 +207,7 @@ describe("a run whose first row cannot be published", () => {
       onError: () => undefined,
     });
     await expect(handle.started).rejects.toThrow("timeline unavailable");
-    const pid = await printedPid(rows);
-    await expectDies(pid, 1000);
+    await expectDies(Number(readFileSync(pidFile, "utf8")), 1000);
   });
 });
 

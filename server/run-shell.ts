@@ -9,7 +9,8 @@ import { buildRow, statusAfterExit, type RunStatus, type StopReason } from "./ro
 import { createThrottledPublisher } from "./throttled-publisher";
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
-const DEFAULT_KILL_GRACE_MS = 3000;
+// Paseo SIGTERMs the plugin process 2 s after asking it to stop, which would skip a later SIGKILL.
+const DEFAULT_KILL_GRACE_MS = 1000;
 const DEFAULT_THROTTLE_MS = 250;
 
 export interface ShellRunOptions {
@@ -95,7 +96,7 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
 
   let stopReason: StopReason | null = null;
   let finished = false;
-  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingKill: { timer: ReturnType<typeof setTimeout>; sent: Promise<void> } | undefined;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
   let resolveDone: () => void = () => {};
   const done = new Promise<void>((resolve) => {
@@ -105,9 +106,15 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
   function finish(status: RunStatus): void {
     if (finished) return;
     finished = true;
-    clearTimeout(killTimer);
     clearTimeout(timeoutTimer);
-    void publisher.finish(row(status)).then(resolveDone);
+    void Promise.all([publisher.finish(row(status)), groupGone()]).then(() => resolveDone());
+  }
+
+  // The shell can exit on SIGTERM while a member that ignores TERM and closed its output lives on.
+  function groupGone(): Promise<void> {
+    if (pendingKill && groupHasMembers()) return pendingKill.sent;
+    clearTimeout(pendingKill?.timer);
+    return Promise.resolve();
   }
 
   const started = publisher.now(runningRow());
@@ -132,12 +139,31 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
     }
   }
 
+  function groupHasMembers(): boolean {
+    if (child.pid === undefined) return false;
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
   function stop(reason: StopReason): void {
     if (finished || stopReason) return;
     stopReason = reason;
     signalGroup("SIGTERM");
-    killTimer = setTimeout(() => signalGroup("SIGKILL"), killGraceMs);
+    let timer!: ReturnType<typeof setTimeout>;
+    const sent = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        signalGroup("SIGKILL");
+        resolve();
+      }, killGraceMs);
+    });
+    pendingKill = { timer, sent };
   }
+
+  started.catch(() => stop("canceled"));
 
   for (const stream of [child.stdout, child.stderr]) {
     const decoder = new StringDecoder("utf8");

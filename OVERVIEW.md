@@ -14,7 +14,7 @@ Standard output and standard error are shown together in the order they arrive, 
 
 - Commands have no input and no terminal. Anything that waits for a keypress, a password, or a prompt will hang until you stop it or it times out.
 - `GIT_EDITOR` is set to `true` and `GIT_TERMINAL_PROMPT` to `0`, after your rc files load, so `git commit` without `-m` fails with git's own message instead of waiting for an editor.
-- A command is stopped after 10 minutes. Stopping, by timeout or by pressing Stop, signals the whole process group, then force-kills it after a few seconds.
+- A command is stopped after 10 minutes. Stopping, by timeout or by pressing Stop, signals the whole process group, then force-kills it after about a second.
 - A command that leaves a background process holding its output open keeps the row running until that process ends or the timeout is reached.
 - The row keeps the last 48 KB of output and says so when earlier output was dropped.
 - Rows are kept in the daemon's memory like other timeline rows, so they do not survive a daemon restart. A command still running when the plugin is reloaded, disabled, or removed is stopped.

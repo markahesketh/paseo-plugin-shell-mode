@@ -29,12 +29,7 @@ export default function contribute(server: PluginServerContext) {
           data,
         }),
     });
-    try {
-      await run.started;
-    } catch (error) {
-      run.cancel();
-      throw error;
-    }
+    await run.started;
     return { runId };
   });
 

@@ -23,7 +23,7 @@ export function alive(pid: number): boolean {
   }
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
+export async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
     if (Date.now() > deadline) throw new Error("condition not met in time");
