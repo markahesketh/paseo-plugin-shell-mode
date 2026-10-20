@@ -1,4 +1,18 @@
 import type { ShellRun } from "../shared/shell-run";
+import type { ShellRunHandle } from "./run-shell";
+
+const tracked: ShellRunHandle[] = [];
+
+export function track(handle: ShellRunHandle): ShellRunHandle {
+  tracked.push(handle);
+  return handle;
+}
+
+export async function stopTracked(): Promise<void> {
+  const handles = tracked.splice(0);
+  for (const handle of handles) handle.cancel();
+  await Promise.all(handles.map((handle) => handle.done));
+}
 
 export async function printedPid(rows: ShellRun[]): Promise<number> {
   const pidLine = /^\d+$/m;

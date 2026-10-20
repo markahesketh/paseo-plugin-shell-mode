@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ShellRun } from "../shared/shell-run";
 import { startShellRun } from "./run-shell";
-import { alive, expectDies, printedPid, waitFor } from "./test-processes";
+import { alive, expectDies, printedPid, stopTracked, track, waitFor } from "./test-processes";
 
 let cwd: string;
 let home: string;
@@ -13,7 +13,8 @@ beforeEach(() => {
   cwd = mkdtempSync(join(tmpdir(), "shell-mode-"));
   home = mkdtempSync(join(tmpdir(), "shell-mode-home-"));
 });
-afterEach(() => {
+afterEach(async () => {
+  await stopTracked();
   rmSync(cwd, { recursive: true, force: true });
   rmSync(home, { recursive: true, force: true });
 });
@@ -33,7 +34,7 @@ function collect() {
 
 async function run(command: string, options: Partial<Parameters<typeof startShellRun>[0]> = {}) {
   const { rows, publish } = collect();
-  const handle = startShellRun({ runId: "run-1", command, cwd, publish, env, ...options });
+  const handle = track(startShellRun({ runId: "run-1", command, cwd, publish, env, ...options }));
   await handle.started;
   await handle.done;
   return { rows, last: rows[rows.length - 1]!, handle };
@@ -89,7 +90,7 @@ describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
 
   it("cancels the whole process group", async () => {
     const { rows, publish } = collect();
-    const handle = startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, publish, env });
+    const handle = track(startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, publish, env }));
     await handle.started;
     const pid = await printedPid(rows);
     expect(alive(pid)).toBe(true);
@@ -101,14 +102,14 @@ describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
 
   it("kills a command that ignores SIGTERM after the grace period", async () => {
     const { rows, publish } = collect();
-    const handle = startShellRun({
+    const handle = track(startShellRun({
       runId: "r",
       command: "trap '' TERM; echo $$; while :; do :; done",
       cwd,
       publish,
       env,
       killGraceMs: 100,
-    });
+    }));
     await handle.started;
     const pid = await printedPid(rows);
     handle.cancel();
@@ -119,14 +120,14 @@ describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
 
   it("kills a background job that ignores SIGTERM and closed its output after the shell exits", async () => {
     const { rows, publish } = collect();
-    const handle = startShellRun({
+    const handle = track(startShellRun({
       runId: "r",
-      command: `sh -c 'trap "" TERM; echo $$; exec >/dev/null 2>&1; while :; do :; done' & wait`,
+      command: `trap 'exit 0' TERM; sh -c 'trap "" TERM HUP; echo $$; exec >/dev/null 2>&1; while :; do :; done' & wait`,
       cwd,
       publish,
       env,
       killGraceMs: 100,
-    });
+    }));
     await handle.started;
     const pid = await printedPid(rows);
     handle.cancel();
@@ -197,7 +198,7 @@ describe("a run whose first row cannot be published", () => {
       await waitFor(() => existsSync(pidFile));
       throw new Error("timeline unavailable");
     };
-    const handle = startShellRun({
+    const handle = track(startShellRun({
       runId: "r",
       command: "trap '' TERM; echo $$ > pid.tmp; mv pid.tmp pid; while :; do :; done",
       cwd,
@@ -205,7 +206,7 @@ describe("a run whose first row cannot be published", () => {
       env,
       killGraceMs: 100,
       onError: () => undefined,
-    });
+    }));
     await expect(handle.started).rejects.toThrow("timeline unavailable");
     await expectDies(Number(readFileSync(pidFile, "utf8")), 1000);
   });

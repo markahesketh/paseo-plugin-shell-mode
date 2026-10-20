@@ -78,6 +78,16 @@ function spawnShell(runId: string, command: string, cwd: string, env: NodeJS.Pro
   return { child: spawn(shell, ["-lic", preamble + command], { ...options, stdio }), marker };
 }
 
+function groupHasMembers(pgid: number | undefined): boolean {
+  if (pgid === undefined) return false;
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
 export function startShellRun(options: ShellRunOptions): ShellRunHandle {
   const { runId, command, cwd } = options;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -96,7 +106,9 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
 
   let stopReason: StopReason | null = null;
   let finished = false;
-  let pendingKill: { timer: ReturnType<typeof setTimeout>; sent: Promise<void> } | undefined;
+  let pendingKill:
+    | { pgid: number | undefined; timer: ReturnType<typeof setTimeout>; sent: Promise<void> }
+    | undefined;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
   let resolveDone: () => void = () => {};
   const done = new Promise<void>((resolve) => {
@@ -112,7 +124,7 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
 
   // The shell can exit on SIGTERM while a member that ignores TERM and closed its output lives on.
   function groupGone(): Promise<void> {
-    if (pendingKill && groupHasMembers()) return pendingKill.sent;
+    if (pendingKill && groupHasMembers(pendingKill.pgid)) return pendingKill.sent;
     clearTimeout(pendingKill?.timer);
     return Promise.resolve();
   }
@@ -139,16 +151,6 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
     }
   }
 
-  function groupHasMembers(): boolean {
-    if (child.pid === undefined) return false;
-    try {
-      process.kill(-child.pid, 0);
-      return true;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code !== "ESRCH";
-    }
-  }
-
   function stop(reason: StopReason): void {
     if (finished || stopReason) return;
     stopReason = reason;
@@ -160,7 +162,7 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
         resolve();
       }, killGraceMs);
     });
-    pendingKill = { timer, sent };
+    pendingKill = { pgid: child.pid, timer, sent };
   }
 
   started.catch(() => stop("canceled"));
