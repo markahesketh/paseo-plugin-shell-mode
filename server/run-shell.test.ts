@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ShellRun } from "../shared/shell-run";
 import { startShellRun } from "./run-shell";
+import { alive, expectDies, printedPid } from "./test-processes";
 
 let cwd: string;
 let home: string;
@@ -90,19 +91,47 @@ describe.each(SHELLS)("startShellRun with $name", ({ shell }) => {
     const { rows, publish } = collect();
     const handle = startShellRun({ runId: "r", command: "sleep 30 & echo $!; wait", cwd, publish, env });
     await handle.started;
-    const pidLine = /^\d+$/m;
-    await waitFor(() => rows.some((row) => pidLine.test(row.output)));
-    const pid = Number(pidLine.exec(rows.find((row) => pidLine.test(row.output))!.output)![0]);
+    const pid = await printedPid(rows);
     expect(alive(pid)).toBe(true);
     handle.cancel();
     await handle.done;
     expect(rows[rows.length - 1]).toMatchObject({ state: "killed", reason: "canceled" });
-    await waitFor(() => !alive(pid));
+    await expectDies(pid);
   });
 
   it("kills a command that ignores SIGTERM after the grace period", async () => {
-    const { last } = await runAndCancel("trap '' TERM; while :; do :; done");
-    expect(last).toMatchObject({ state: "killed", reason: "canceled" });
+    const { rows, publish } = collect();
+    const handle = startShellRun({
+      runId: "r",
+      command: "trap '' TERM; echo $$; while :; do :; done",
+      cwd,
+      publish,
+      env,
+      killGraceMs: 100,
+    });
+    await handle.started;
+    const pid = await printedPid(rows);
+    handle.cancel();
+    await handle.done;
+    expect(rows[rows.length - 1]).toMatchObject({ state: "killed", reason: "canceled" });
+    await expectDies(pid);
+  });
+
+  it("kills a background job that ignores SIGTERM and closed its output after the shell exits", async () => {
+    const { rows, publish } = collect();
+    const handle = startShellRun({
+      runId: "r",
+      command: `sh -c 'trap "" TERM; echo $$; exec >/dev/null 2>&1; while :; do :; done' & wait`,
+      cwd,
+      publish,
+      env,
+      killGraceMs: 100,
+    });
+    await handle.started;
+    const pid = await printedPid(rows);
+    handle.cancel();
+    await handle.done;
+    await expectDies(pid, 500);
   });
 
   it("kills a command that outlives the timeout", async () => {
@@ -160,6 +189,29 @@ describe.each(BASHES)("bash %s profile", (shell) => {
   });
 });
 
+describe("a run whose first row cannot be published", () => {
+  it("kills the command", async () => {
+    env = isolatedEnv("/bin/sh");
+    const rows: ShellRun[] = [];
+    const publish = async (row: ShellRun) => {
+      rows.push(row);
+      throw new Error("timeline unavailable");
+    };
+    const handle = startShellRun({
+      runId: "r",
+      command: "trap '' TERM; echo $$; while :; do :; done",
+      cwd,
+      publish,
+      env,
+      killGraceMs: 100,
+      onError: () => undefined,
+    });
+    await expect(handle.started).rejects.toThrow("timeline unavailable");
+    const pid = await printedPid(rows);
+    await expectDies(pid, 1000);
+  });
+});
+
 describe("shells without rc support", () => {
   it("runs with -c and does not read rc files", async () => {
     writeFileSync(join(home, ".profile"), "echo profile-noise\n");
@@ -168,30 +220,3 @@ describe("shells without rc support", () => {
     expect(last.output).toBe("ok\n");
   });
 });
-
-async function runAndCancel(command: string) {
-  const { rows, publish } = collect();
-  const handle = startShellRun({ runId: "r", command, cwd, publish, env, killGraceMs: 100 });
-  await handle.started;
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  handle.cancel();
-  await handle.done;
-  return { last: rows[rows.length - 1]! };
-}
-
-function alive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!condition()) {
-    if (Date.now() > deadline) throw new Error("condition not met in time");
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-}
