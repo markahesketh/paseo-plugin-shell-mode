@@ -119,11 +119,10 @@ export function startShellRun(options: ShellRunOptions): ShellRunHandle {
     if (finished) return;
     finished = true;
     clearTimeout(timeoutTimer);
-    void Promise.all([publisher.finish(row(status)), groupGone()]).then(() => resolveDone());
+    void Promise.all([publisher.finish(row(status)), awaitLingeringKill()]).then(() => resolveDone());
   }
 
-  // The shell can exit on SIGTERM while a member that ignores TERM and closed its output lives on.
-  function groupGone(): Promise<void> {
+  function awaitLingeringKill(): Promise<void> {
     if (pendingKill && groupHasMembers(pendingKill.pgid)) return pendingKill.sent;
     clearTimeout(pendingKill?.timer);
     return Promise.resolve();

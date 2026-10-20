@@ -6,7 +6,6 @@ import type { ShellRun } from "../shared/shell-run";
 import { createShellRuns } from "./runs";
 import { expectDies, printedPid, stopTracked, track } from "./test-processes";
 
-// Paseo sends the plugin process SIGTERM 2 s after asking it to stop.
 const PASEO_SHUTDOWN_DEADLINE_MS = 2000;
 
 let cwd: string;
